@@ -5,16 +5,15 @@
  */
 
 import { definePluginSettings } from "@api/Settings";
-import { EquicordDevs } from "@utils/constants";
+import { Devs } from "@utils/constants";
 import { Logger } from "@utils/Logger";
-import definePlugin, { OptionType, PluginNative } from "@utils/types";
+import definePlugin, { OptionType, PluginNative, ReporterTestable } from "@utils/types";
 
 import { initWs, sockets, startMcpIpcBridge, stopMcpIpcBridge, stopWs } from "./ws";
 
-export const DEFAULT_PORT = 8487;
 export const logger = new Logger("DevCompanionExtended");
 
-const Native = VencordNative.pluginHelpers.devcompanionExtended as PluginNative<typeof import("./native")>;
+const Native = VencordNative.pluginHelpers.DevCompanionExtended as PluginNative<typeof import("./native")>;
 
 export const settings = definePluginSettings({
     notifyOnConnect: {
@@ -123,9 +122,11 @@ export const settings = definePluginSettings({
 });
 
 export default definePlugin({
-    name: "devcompanionExtended",
-    description: "MCP server for Devcompanion",
-    authors: [EquicordDevs.Prism, EquicordDevs.justjxke],
+    name: "DevCompanionExtended",
+    description: "MCP server for DevCompanion",
+    tags: ["Developers"],
+    authors: [Devs.prism, { name: "justjxke", id: 852558183087472640n }, { name: "__azuree__", id: 451657007791996929n }],
+    reporterTestable: ReporterTestable.None,
 
     settings,
 
@@ -139,63 +140,63 @@ export default definePlugin({
                 .filter(([, sock]) => sock.readyState === WebSocket.OPEN)
                 .map(([port]) => port)
                 .sort((a, b) => a - b);
-            if (openPorts.length) {
+            if (openPorts.length)
                 logger.info(`WebSocket(s) connected on ports: ${openPorts.join(", ")}`);
-            } else {
+            else
                 logger.warn("No WebSocket connections");
+
+            if (Native?.getServerStatus) {
+                void Native.getServerStatus().then(status => {
+                    logger.info(`IPC MCP server: ${status.running ? `running on port ${status.port}` : "stopped"}`);
+                }).catch(() => {
+                    logger.warn("IPC MCP server: unavailable");
+                });
             }
         }
     },
 
     async start() {
-        logger.info("Devcompanion starting...");
+        logger.info("DevCompanionExtended starting...");
         try {
             if (settings.store.enableIpcServer) {
                 if (!Native?.startServer || !Native?.getNextRequest || !Native?.sendResponse) {
-                    logger.warn("IPC MCP native helper missing; rebuild Equicord to enable IPC server");
+                    logger.warn("IPC MCP native helper missing; rebuild Vencord to enable IPC server");
                 } else {
-                    if (settings.store.debugMode) {
+                    if (settings.store.debugMode)
                         logger.info(`IPC native helpers: ${Object.keys(Native).join(", ") || "none"}`);
-                    }
+
                     startMcpIpcBridge();
                     let result = await Native.startServer(settings.store.ipcPort);
+
                     if (!result?.ok && result?.code === "EADDRINUSE" && settings.store.ipcPort !== 0) {
-                        logger.warn(`IPC MCP port ${settings.store.ipcPort} is in use; falling back to auto port`);
+                        logger.warn(`IPC MCP port ${settings.store.ipcPort} in use; falling back to auto port`);
                         result = await Native.startServer(0);
                     }
+
                     if (result?.ok) {
-                        logger.info(`IPC MCP server listening on port ${result?.port}`);
-                        if (Native?.getServerStatus) {
-                            try {
-                                const status = await Native.getServerStatus();
-                                logger.info(`IPC MCP status: ${status.running ? "running" : "stopped"} on port ${status.port}`);
-                            } catch (statusError) {
-                                logger.warn(`IPC MCP status check failed: ${String(statusError)}`);
-                            }
-                        }
+                        logger.info(`IPC MCP server listening on port ${result.port}`);
                         return;
                     }
-                    if (!result?.ok) {
-                        logger.warn("IPC MCP server failed to start, falling back to WebSocket");
-                        if (settings.store.enableWebSocketFallback) {
-                            initWs();
-                            logger.info("WebSocket fallback initialization started");
-                        }
-                        return;
+
+                    logger.warn("IPC MCP server failed to start");
+                    if (settings.store.enableWebSocketFallback) {
+                        initWs();
+                        logger.info("WebSocket fallback started");
                     }
                     return;
                 }
             }
+
             if (settings.store.enableWebSocketFallback) {
                 initWs();
-                logger.info(settings.store.enableIpcServer ? "WebSocket fallback initialization started" : "WebSocket initialization started");
+                logger.info("WebSocket initialization started");
             }
         } catch (error) {
-            logger.error("oh fuck: " + String(error));
+            logger.error("Failed to start: " + String(error));
             if (settings.store.enableWebSocketFallback) {
                 try {
                     initWs();
-                    logger.info("WebSocket fallback initialization started");
+                    logger.info("WebSocket fallback started after error");
                 } catch (fallbackError) {
                     logger.error("WebSocket fallback failed: " + String(fallbackError));
                 }
@@ -204,7 +205,7 @@ export default definePlugin({
     },
 
     stop() {
-        logger.info("Devcompanion stopping...");
+        logger.info("DevCompanionExtended stopping...");
         stopWs();
         stopMcpIpcBridge();
         try {

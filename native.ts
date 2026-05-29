@@ -5,7 +5,7 @@
  */
 
 import { randomUUID } from "crypto";
-import { BrowserWindow } from "electron";
+import { BrowserWindow, IpcMainInvokeEvent } from "electron";
 import { createServer, IncomingMessage, Server, ServerResponse } from "http";
 
 type MCPRequest = {
@@ -72,7 +72,7 @@ function getMainWindow(): BrowserWindow | null {
     return BrowserWindow.getAllWindows().find(w => !w.isDestroyed()) ?? null;
 }
 
-export async function startServer(_: Electron.IpcMainInvokeEvent, port = 8486): Promise<StartServerResult> {
+export async function startServer(_: IpcMainInvokeEvent, port = 8486): Promise<StartServerResult> {
     for (const [id, resolve] of pendingRequests) {
         resolve({ jsonrpc: "2.0", id, error: { code: -32603, message: "Session reset" } });
     }
@@ -100,8 +100,8 @@ export async function startServer(_: Electron.IpcMainInvokeEvent, port = 8486): 
             return;
         }
 
-        const window = getMainWindow();
-        if (!window) {
+        const mainWindow = getMainWindow();
+        if (!mainWindow) {
             sendError(res, null, -32603, "Discord window not found", effectiveSessionId);
             return;
         }
@@ -163,13 +163,13 @@ export async function startServer(_: Electron.IpcMainInvokeEvent, port = 8486): 
             const actualPort = typeof address === "object" && address ? address.port : port;
             server = nextServer;
             currentPort = actualPort;
-            console.log(`[DevCompanionExtended] IPC MCP server listening on ${HOST}:${actualPort}`);
+            console.log(`DevCompanionExtended: IPC MCP server listening on ${HOST}:${actualPort}`);
             resolve({ ok: true, port: actualPort });
         });
     });
 }
 
-export function stopServer(_: Electron.IpcMainInvokeEvent): OkResult {
+export function stopServer(_: IpcMainInvokeEvent): OkResult {
     for (const [id, resolve] of pendingRequests) {
         resolve({ jsonrpc: "2.0", id, error: { code: -32603, message: "Server stopped" } });
     }
@@ -181,15 +181,15 @@ export function stopServer(_: Electron.IpcMainInvokeEvent): OkResult {
     return { ok: true };
 }
 
-export function getServerStatus(_: Electron.IpcMainInvokeEvent): ServerStatus {
+export function getServerStatus(_: IpcMainInvokeEvent): ServerStatus {
     return { running: server !== null, port: currentPort };
 }
 
-export function getNextRequest(_: Electron.IpcMainInvokeEvent): { id: number; request: MCPRequest; } | null {
+export function getNextRequest(_: IpcMainInvokeEvent): { id: number; request: MCPRequest; } | null {
     return requestQueue.shift() ?? null;
 }
 
-export function sendResponse(_: Electron.IpcMainInvokeEvent, id: number, response: MCPResponse | null): OkResult {
+export function sendResponse(_: IpcMainInvokeEvent, id: number, response: MCPResponse | null): OkResult {
     const resolve = pendingRequests.get(id);
     if (!resolve) return { ok: false };
     pendingRequests.delete(id);

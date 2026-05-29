@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+import { showNotification } from "@api/Notifications";
 import { Settings } from "@api/Settings";
 import { getIntlMessageFromHash } from "@utils/discord";
 import { runtimeHashMessageKey } from "@utils/intlHash";
@@ -11,14 +12,124 @@ import { canonicalizeMatch } from "@utils/patches";
 import { PluginNative } from "@utils/types";
 import { filters, findAll, fluxStores, search, wreq } from "@webpack";
 import * as Common from "@webpack/common";
-import { Constants, FluxDispatcher, RestAPI, Toasts } from "@webpack/common";
-import { WebpackPatcher } from "Vencord";
+import { Constants, FluxDispatcher, RestAPI } from "@webpack/common";
 
-import { DEFAULT_PORT, logger, settings } from ".";
-import { getMcpTools } from "./mcpTools";
+import { logger, settings } from ".";
+import { getMcpTools } from "./lib/mcpTools";
+import {
+    ANALYTICS_TARGET_CACHE_TTL_MS,
+    asyncIterateModules,
+    CACHE_TTL,
+    componentNameCache,
+    executeWithCache,
+    exportModuleIdCache,
+    moduleCache,
+    ModuleSearchEngine,
+    PATCHED_CACHE_TTL_MS,
+    patchedModulesCache,
+    patchedModulesInFlight,
+    storeCache,
+    STORE_CACHE_TTL_MS,
+    TOOL_CACHE_MAX_ENTRIES,
+    toolCacheHits,
+    toolCacheStores,
+    toolResponseCache,
+    toolResponseInFlight,
+} from "./lib/cache";
+import {
+    buildErrorResponse,
+    buildToolResponse,
+    readResource,
+    storeResource,
+    updateResource,
+} from "./lib/resources";
+import {
+    BatchToolRequest,
+    BulkSearchRequest,
+    CallRestApiRequest,
+    CanonicalizeIntlRequest,
+    ComponentLocatorRequest,
+    DiffRequest,
+    DispatcherActionsRequest,
+    DispatchFluxRequest,
+    EvaluateCodeRequest,
+    EventListenerAuditRequest,
+    ExtractRequest,
+    FindAllRequest,
+    FindByCodeRequest,
+    FindByPropsRequest,
+    FindComponentByCodeRequest,
+    FindEnumRequest,
+    FindExportValueRequest,
+    FindTextNodesRequest,
+    GetCurrentContextResult,
+    GetEndpointsRequest,
+    GetFluxEventsRequest,
+    GetIntlKeysRequest,
+    GetModuleIdsRequest,
+    GetPrototypeMethodsRequest,
+    GetStoreStateRequest,
+    GetStoreSubscriptionsRequest,
+    InspectDomPathRequest,
+    InterceptRequest,
+    ListDomClassesRequest,
+    MCPRequest,
+    MCPResponse,
+    MessageHandler,
+    PatchIndexEntry,
+    PatchLintRequest,
+    PluginSettingsRequest,
+    PluginToggleRequest,
+    QueryDomRequest,
+    ReverseIntlHashRequest,
+    SearchContextRequest,
+    SearchIntlInModuleRequest,
+    SearchLiteralRequest,
+    SearchRequest,
+    StoreDiffRequest,
+    StoreFindRequest,
+    StoreMethodsRequest,
+    TestPatchRequest,
+    ToolCallResult,
+    TraceRequest,
+    WSMessage,
+} from "./lib/types";
+import {
+    analyzePatternQuality,
+    buildTree,
+    collectAttributes,
+    collectPatchWarnings,
+    elementPath,
+    ensureBaseFields,
+    escapeRegex,
+    extractAnchorCandidates,
+    extractStringLiterals,
+    filterFields,
+    findLookbehindAnchor,
+    getLineColumn,
+    getLineContext,
+    getMatchContext,
+    normalizeText,
+    parseRegex,
+    parseRegexArg,
+    parseRegexString,
+    parsePotentialRegex,
+    redactSensitive,
+    safeSerialize,
+    sliceSnippets,
+    toOptionalBoolean,
+    toOptionalNumber,
+    toOptionalString,
+    trimPreviewText,
+    truncatePayload,
+    truncatePayloadDepth,
+    summarizeNode,
+} from "./lib/utils";
+import { getFactoryPatchedBy, getFactoryPatchedSource } from "@webpack/patcher";
 
-const { getFactoryPatchedBy, getFactoryPatchedSource } = WebpackPatcher;
-const Native = VencordNative.pluginHelpers.devcompanionExtended as PluginNative<typeof import("./native")>;
+const Native = VencordNative.pluginHelpers.DevCompanionExtended as PluginNative<typeof import("./native")>;
+
+const DEFAULT_PORT = 8487;
 
 export const sockets = new Map<number, WebSocket>();
 type ConnectionState = { socket?: WebSocket; reconnectTimeout?: NodeJS.Timeout; reconnectAttempts: number; };
@@ -35,7 +146,6 @@ const stoppedPorts = new Set<number>();
 let stoppedPortsTimer: NodeJS.Timeout | undefined;
 let warmupStarted = false;
 
-type PatchIndexEntry = { moduleId: number; patchedBy: string[]; };
 const patchIndex: {
     ready: boolean;
     inFlight: Promise<void> | null;
@@ -145,689 +255,11 @@ function recordStoppedPort(port: number) {
     scheduleStoppedPortsLog();
 }
 
-async function* asyncIterateModules<T>(
-    processor: (id: string, code: string) => T | null,
-    filter?: (id: string) => boolean
-): AsyncGenerator<T, void, unknown> {
-    const modules = Object.keys(wreq.m);
-    const batchSize = 10;
-    let processed = 0;
 
-    for (let i = 0; i < modules.length; i += batchSize) {
-        const batch = modules.slice(i, Math.min(i + batchSize, modules.length));
 
-        await new Promise(resolve => setTimeout(resolve, 0));
-
-        for (const id of batch) {
-            if (filter && !filter(id)) continue;
-
-            const code = wreq.m[id].toString();
-            const result = processor(id, code);
-
-            if (result !== null) {
-                yield result;
-            }
-
-            processed++;
-
-            if (processed % 100 === 0) {
-                await new Promise(resolve => requestAnimationFrame(resolve));
-            }
-        }
-    }
-}
-
-class ModuleSearchEngine {
-    private static codeCache = new Map<string, { code: string; hash: number; }>();
-    private static searchIndex = new Map<string, { ids: Set<string>; timestamp: number; }>();
-    private static literalCache = new Map<string, { timestamp: number; matches: Array<{ id: number; preview: string; occurrences: number; offsets: number[]; snippets: string[]; }>; }>();
-    private static tokenIndex = new Map<string, Set<string>>();
-    private static tokenIndexReady = false;
-    private static tokenIndexInFlight: Promise<void> | null = null;
-    private static tokenIndexDisabled = false;
-    private static tokenIndexLoggedHit = false;
-    private static readonly INDEX_TTL_MS = 60000;
-    private static readonly LITERAL_TTL_MS = 30000;
-    private static readonly TOKEN_INDEX_LIMIT = 200000;
-    private static readonly TOKEN_MAX_PER_MODULE = 200;
-    private static readonly TOKEN_REGEX = /[A-Za-z_][A-Za-z0-9_]{2,}/g;
-
-    static hashCode(str: string): number {
-        let hash = 0;
-        for (let i = 0; i < Math.min(str.length, 1000); i++) {
-            hash = ((hash << 5) - hash) + str.charCodeAt(i);
-            hash |= 0;
-        }
-        return hash;
-    }
-
-    static getModuleCode(id: string): string {
-        const cached = this.codeCache.get(id);
-        if (cached) return cached.code;
-
-        const code = wreq.m[id].toString();
-        this.codeCache.set(id, { code, hash: this.hashCode(code) });
-
-        if (this.codeCache.size > 500) {
-            const firstKey = this.codeCache.keys().next().value;
-            if (firstKey) {
-                this.codeCache.delete(firstKey);
-            }
-        }
-
-        return code;
-    }
-
-    static async* searchPattern(pattern: string | RegExp): AsyncGenerator<{ id: string; code: string; }, void, unknown> {
-        const isRegex = pattern instanceof RegExp;
-        const searchStr = isRegex ? "" : pattern;
-
-        if (!isRegex && searchStr.length > 3) {
-            const candidates = await this.getIndexedCandidates(searchStr);
-            if (candidates) {
-                for (const id of candidates) {
-                    const code = this.getModuleCode(id);
-                    if (isRegex ? pattern.test(code) : code.includes(searchStr)) {
-                        yield { id, code };
-                    }
-                }
-                return;
-            }
-        }
-
-        if (!isRegex && searchStr.length > 3) {
-            const key = searchStr.substring(0, 3);
-            const indexed = this.searchIndex.get(key);
-            if (indexed && Date.now() - indexed.timestamp < this.INDEX_TTL_MS) {
-                for (const id of indexed.ids) {
-                    const code = this.getModuleCode(id);
-                    if (isRegex ? pattern.test(code) : code.includes(searchStr)) {
-                        yield { id, code };
-                    }
-                }
-                return;
-            }
-        }
-
-        yield* asyncIterateModules((id, code) => {
-            const matches = isRegex ? pattern.test(code) : code.includes(searchStr);
-            if (matches) {
-                if (!isRegex && searchStr.length > 3) {
-                    const key = searchStr.substring(0, 3);
-                    if (!this.searchIndex.has(key)) {
-                        this.searchIndex.set(key, { ids: new Set(), timestamp: Date.now() });
-                    }
-                    const entry = this.searchIndex.get(key)!;
-                    entry.ids.add(id);
-                    entry.timestamp = Date.now();
-                }
-                return { id, code };
-            }
-            return null;
-        });
-    }
-
-    static clearCache() {
-        this.codeCache.clear();
-        this.searchIndex.clear();
-        this.patternCache.clear();
-        this.literalCache.clear();
-        this.tokenIndex.clear();
-        this.tokenIndexReady = false;
-        this.tokenIndexDisabled = false;
-        this.tokenIndexInFlight = null;
-    }
-
-    private static patternCache = new Map<string, Array<{ id: string; code: string; }>>();
-
-    static getCachedResults(pattern: string | RegExp): Array<{ id: string; code: string; }> {
-        const key = pattern instanceof RegExp ? pattern.toString() : pattern;
-        return this.patternCache.get(key) || [];
-    }
-
-    static addToCache(pattern: string | RegExp, id: string, code: string): void {
-        const key = pattern instanceof RegExp ? pattern.toString() : pattern;
-        if (!this.patternCache.has(key)) {
-            this.patternCache.set(key, []);
-        }
-        const cached = this.patternCache.get(key)!;
-        if (cached.length >= 20) return;
-        if (!cached.some(item => item.id === id)) {
-            cached.push({ id, code: code.substring(0, 500) });
-        }
-        if (this.patternCache.size > 50) {
-            const keys = Array.from(this.patternCache.keys());
-            for (let i = 0; i < 25; i++) {
-                this.patternCache.delete(keys[i]);
-            }
-        }
-    }
-
-    static getLiteralCache(query: string): Array<{ id: number; preview: string; occurrences: number; offsets: number[]; snippets: string[]; }> | null {
-        const entry = this.literalCache.get(query);
-        if (!entry) return null;
-        if (Date.now() - entry.timestamp > this.LITERAL_TTL_MS) {
-            this.literalCache.delete(query);
-            return null;
-        }
-        return entry.matches;
-    }
-
-    static setLiteralCache(query: string, matches: Array<{ id: number; preview: string; occurrences: number; offsets: number[]; snippets: string[]; }>) {
-        this.literalCache.set(query, { timestamp: Date.now(), matches });
-        if (this.literalCache.size > 50) {
-            const keys = Array.from(this.literalCache.keys());
-            for (let i = 0; i < 25; i++) {
-                this.literalCache.delete(keys[i]);
-            }
-        }
-    }
-
-    private static extractTokens(text: string): string[] {
-        const matches = text.match(this.TOKEN_REGEX);
-        if (!matches) return [];
-        const unique = new Set<string>();
-        for (const token of matches) {
-            unique.add(token.toLowerCase());
-            if (unique.size >= this.TOKEN_MAX_PER_MODULE) break;
-        }
-        return Array.from(unique);
-    }
-
-    private static addToken(token: string, moduleId: string): boolean {
-        let entry = this.tokenIndex.get(token);
-        if (!entry) {
-            if (this.tokenIndex.size >= this.TOKEN_INDEX_LIMIT) {
-                return false;
-            }
-            entry = new Set();
-            this.tokenIndex.set(token, entry);
-        }
-        entry.add(moduleId);
-        return true;
-    }
-
-    static async ensureTokenIndex(): Promise<void> {
-        if (!settings.store.prebuildSearchIndex || this.tokenIndexDisabled) return;
-        if (this.tokenIndexReady) return;
-        if (this.tokenIndexInFlight) return this.tokenIndexInFlight;
-
-        this.tokenIndexInFlight = (async () => {
-            const moduleIds = Object.keys(wreq.m);
-            const batchSize = 10;
-            let processed = 0;
-            debugInfo(`Building search index for ${moduleIds.length} modules...`);
-
-            for (let i = 0; i < moduleIds.length; i += batchSize) {
-                const batch = moduleIds.slice(i, Math.min(i + batchSize, moduleIds.length));
-                await new Promise(resolve => setTimeout(resolve, 0));
-
-                for (const id of batch) {
-                    const code = wreq.m[id].toString();
-                    const tokens = this.extractTokens(code);
-                    for (const token of tokens) {
-                        if (!this.addToken(token, id)) {
-                            this.tokenIndexDisabled = true;
-                            this.tokenIndex.clear();
-                            logger.warn("Prebuilt search index disabled: token limit exceeded");
-                            return;
-                        }
-                    }
-                    processed++;
-                    if (processed % 100 === 0) {
-                        await new Promise(resolve => requestAnimationFrame(resolve));
-                    }
-                }
-            }
-
-            this.tokenIndexReady = true;
-            debugInfo(`Search index ready: ${processed} modules, ${this.tokenIndex.size} tokens`);
-        })().finally(() => {
-            this.tokenIndexInFlight = null;
-        });
-
-        return this.tokenIndexInFlight;
-    }
-
-    static async getIndexedCandidates(query: string): Promise<Set<string> | null> {
-        if (!settings.store.prebuildSearchIndex || this.tokenIndexDisabled) return null;
-        await this.ensureTokenIndex();
-        if (!this.tokenIndexReady) return null;
-
-        const tokens = this.extractTokens(query);
-        if (!tokens.length) return null;
-
-        let best: Set<string> | null = null;
-        for (const token of tokens) {
-            const candidates = this.tokenIndex.get(token);
-            if (!candidates) continue;
-            if (!best || candidates.size < best.size) {
-                best = candidates;
-            }
-        }
-
-        if (best && !this.tokenIndexLoggedHit) {
-            this.tokenIndexLoggedHit = true;
-            debugInfo(`Search index hit: ${best.size} candidate modules`);
-        }
-        return best;
-    }
-}
-
-type DomNodeSummary = {
-    tag: string;
-    id?: string;
-    classes: string[];
-    text?: string;
-    attrs?: Record<string, string>;
-    childCount: number;
-    children?: DomNodeSummary[];
-};
-
-function normalizeText(text: string, maxLength: number): string {
-    const clean = text.replace(/\s+/g, " ").trim();
-    if (clean.length > maxLength) {
-        return clean.slice(0, maxLength) + "...";
-    }
-    return clean;
-}
-
-function collectAttributes(el: Element, max = 10): Record<string, string> {
-    const attrs: Record<string, string> = {};
-    for (const attr of Array.from(el.attributes).slice(0, max)) {
-        attrs[attr.name] = attr.value;
-    }
-    return attrs;
-}
-
-function elementPath(el: Element): string {
-    const parts: string[] = [];
-    let node: Element | null = el;
-    let depth = 0;
-    while (node && depth < 10) {
-        const tag = node.tagName.toLowerCase();
-        const id = node.id ? `#${node.id}` : "";
-        const classes = node.classList.length ? "." + Array.from(node.classList).slice(0, 2).join(".") : "";
-        const parent = node.parentElement;
-        let nth = "";
-        if (parent) {
-            const siblings = Array.from(parent.children);
-            const index = siblings.indexOf(node);
-            nth = `:nth-child(${index + 1})`;
-        }
-        parts.unshift(`${tag}${id}${classes}${nth}`);
-        node = parent;
-        depth++;
-    }
-    return parts.join(" > ");
-}
-
-function summarizeNode(el: Element, includeText: boolean, includeAttrs: boolean, maxTextLength: number): DomNodeSummary {
-    const text = includeText ? normalizeText(el.textContent || "", maxTextLength) : undefined;
-    return {
-        tag: el.tagName.toLowerCase(),
-        id: el.id || undefined,
-        classes: Array.from(el.classList),
-        text: text && text.length > 0 ? text : undefined,
-        attrs: includeAttrs ? collectAttributes(el) : undefined,
-        childCount: el.childElementCount
-    };
-}
-
-function buildTree(el: Element, depth: number, breadth: number, includeText: boolean, maxTextLength: number): DomNodeSummary {
-    const node = summarizeNode(el, includeText, false, maxTextLength);
-    if (depth <= 0) {
-        return node;
-    }
-    const children: Element[] = Array.from(el.children).slice(0, breadth);
-    if (children.length > 0) {
-        node.children = children.map(child => buildTree(child, depth - 1, breadth, includeText, maxTextLength));
-    }
-    return node;
-}
-
-interface WSMessage {
-    type: "tool_call";
-    data: { name: string; arguments?: Record<string, unknown>; raw?: boolean; };
-    nonce: number;
-}
-
-interface RegexNode {
-    type: "regex";
-    value: { pattern: string; flags: string; };
-}
-
-interface StringNode {
-    type: "string";
-    value: string;
-}
-
-type ArgNode = RegexNode | StringNode;
-
-interface SearchRequest {
-    findType: string;
-    args: ArgNode[];
-}
-
-interface FindByPropsRequest {
-    props: string[];
-}
-
-interface FindByCodeRequest {
-    code: string[];
-}
-
-interface FindStoreRequest {
-    name: string;
-}
-
-interface FindComponentByCodeRequest {
-    code: string[];
-}
-
-interface FindAllRequest {
-    props: string[];
-    limit?: number;
-}
-
-interface GetModuleIdsRequest {
-    limit?: number;
-}
-
-interface GetFluxEventsRequest {
-    filter?: string;
-}
-
-interface GetIntlKeysRequest {
-    filter?: string;
-    limit?: number;
-}
-
-interface ExtractRequest {
-    moduleId: PropertyKey;
-    usePatched?: boolean;
-    maxLength?: number;
-}
-
-interface DiffRequest {
-    moduleId: PropertyKey;
-}
-
-interface TestPatchRequest {
-    find: string | { pattern: string; flags: string; };
-    replacements: Array<{
-        match: string | { pattern: string; flags: string; };
-        replace: string;
-    }>;
-    preview?: boolean;
-    previewMode?: "compact" | "full" | "context-only";
-    contextLines?: number;
-    radius?: number;
-}
-
-interface PatchLintRequest {
-    find: string | { pattern: string; flags: string; };
-    replacements: Array<{
-        match: string | { pattern: string; flags: string; };
-        replace: string;
-    }>;
-    moduleId?: number;
-}
-
-interface PluginToggleRequest {
-    pluginName: string;
-    enabled: boolean;
-}
-
-interface BulkSearchRequest {
-    queries: Array<{
-        name?: string;
-        findType: string;
-        args: ArgNode[];
-    }>;
-}
-
-interface QueryDomRequest {
-    selector: string;
-    limit?: number;
-    includeText?: boolean;
-    includeAttrs?: boolean;
-    maxTextLength?: number;
-}
-
-interface InspectDomPathRequest {
-    selector: string;
-    index?: number;
-    depth?: number;
-    breadth?: number;
-    includeText?: boolean;
-    maxTextLength?: number;
-}
-
-interface ListDomClassesRequest {
-    maxNodes?: number;
-    maxClasses?: number;
-}
-
-interface FindTextNodesRequest {
-    query: string;
-    isRegex?: boolean;
-    maxResults?: number;
-    maxTextLength?: number;
-}
-
-interface SearchLiteralRequest {
-    query: string;
-    isRegex?: boolean;
-    limit?: number;
-    offset?: number;
-    preset?: "compact" | "full" | "minimal";
-}
-
-interface SearchContextRequest {
-    pattern: string;
-    isRegex?: boolean;
-    limit?: number;
-    matchLimit?: number;
-    radius?: number;
-    contextLines?: number;
-}
-
-interface ComponentLocatorRequest {
-    query: string;
-    isRegex?: boolean;
-    limit?: number;
-}
-
-interface DispatcherActionsRequest {
-    filter?: string;
-    isRegex?: boolean;
-}
-
-interface EventListenerAuditRequest {
-    event?: string;
-    limit?: number;
-}
-
-interface EvaluateCodeRequest {
-    code: string;
-    async?: boolean;
-    expression?: boolean;
-    timeoutMs?: number;
-    maxOutputChars?: number;
-}
-
-interface CallRestApiRequest {
-    method: "get" | "post" | "put" | "patch" | "del";
-    url: string;
-    body?: unknown;
-    query?: Record<string, string | number | boolean>;
-    headers?: Record<string, string>;
-}
-
-interface GetStoreStateRequest {
-    storeName: string;
-}
-
-interface GetStoreSubscriptionsRequest {
-    storeName: string;
-    limit?: number;
-}
-
-interface GetEndpointsRequest {
-    filter?: string;
-}
-
-interface DispatchFluxRequest {
-    action: Record<string, unknown>;
-}
-
-interface FindEnumRequest {
-    query: string;
-    limit?: number;
-    includeMembers?: boolean;
-}
-
-interface FindExportValueRequest {
-    moduleId: number;
-    exportName: string;
-}
-
-interface GetPrototypeMethodsRequest {
-    moduleId: number;
-    exportName?: string;
-}
-
-interface CanonicalizeIntlRequest {
-    text: string;
-}
-
-interface ReverseIntlHashRequest {
-    hashedKey: string;
-}
-
-interface SearchIntlInModuleRequest {
-    moduleId: number;
-}
-
-interface PluginSettingsRequest {
-    pluginId: string;
-    action: "get" | "set" | "dry-run";
-    values?: Record<string, unknown>;
-}
-
-interface StoreFindRequest {
-    name: string;
-}
-
-interface StoreMethodsRequest {
-    storeName: string;
-}
-
-interface StoreDiffRequest {
-    storeName: string;
-    limit?: number;
-}
-
-interface TraceRequest {
-    action: "events" | "handlers" | "storeEvents" | "start" | "get" | "stop" | "store" | "status" | "clear";
-    event?: string;
-    filter?: string;
-    isRegex?: boolean;
-    storeName?: string;
-    limit?: number;
-    offset?: number;
-    maxEntries?: number;
-    redact?: boolean;
-    fields?: string[];
-    sampleRate?: number;
-    matchPayload?: string;
-    maxPayloadChars?: number;
-    maxPayloadDepth?: number;
-}
-
-interface InterceptRequest {
-    action: "set" | "get" | "stop" | "status";
-    moduleId?: number;
-    exportName?: string;
-    path?: string;
-    id?: string;
-    limit?: number;
-    offset?: number;
-    maxEntries?: number;
-    sampleRate?: number;
-    matchArgs?: string;
-    matchResult?: string;
-    isRegex?: boolean;
-}
-
-interface GetCurrentContextResult {
-    wsPorts: number[];
-    connections: number;
-    user: { id: string; username: string; discriminator?: string; globalName?: string | null; } | null;
-    channel: { id: string; name: string; type: number; } | null;
-    guild: { id: string; name: string; ownerId: string; } | null;
-    buildNumber: number | null;
-    locale: string | null;
-    moduleCount: number;
-    guildCount: number;
-}
-
-type MessageHandler = (data: unknown) => unknown | Promise<unknown>;
-
-type MCPRequest = {
-    jsonrpc: "2.0";
-    id?: number | string;
-    method: string;
-    params?: Record<string, unknown>;
-};
-
-type MCPResponse = {
-    jsonrpc: "2.0";
-    id: number | string | null;
-    result?: unknown;
-    error?: { code: number; message: string; data?: unknown; };
-};
-
-type ToolCallResult = {
-    content: Array<{ type: "text"; text: string; }>;
-    isError?: boolean;
-};
-
-type FindNode = { type: "string"; value: string; } | { type: "regex"; value: { pattern: string; flags: string; }; };
 
 let mcpIpcActive = false;
 let mcpIpcLoopActive = false;
-
-const resourceStore = new Map<string, { mimeType: string; text: string; createdAt: number; }>();
-const RESOURCE_MAX_AGE_MS = 5 * 60 * 1000;
-const RESOURCE_MAX_ENTRIES = 200;
-
-const moduleCache = new Map<string, { code: string; timestamp: number; }>();
-const CACHE_TTL = 10000;
-const STORE_CACHE_TTL_MS = 120000;
-const PATCHED_CACHE_TTL_MS = 60000;
-const TOOL_CACHE_TTL_MS = 10000;
-const ANALYTICS_TARGET_CACHE_TTL_MS = 30000;
-const TOOL_CACHE_MAX_ENTRIES = 300;
-const TOOL_CACHE_OVERRIDES = new Map<string, number>([
-    ["store", STORE_CACHE_TTL_MS],
-    ["patch", PATCHED_CACHE_TTL_MS],
-    ["search", 30000],
-    ["module", 30000]
-]);
-const toolResponseCache = new Map<string, { timestamp: number; ttlMs: number; value: unknown; }>();
-const toolResponseInFlight = new Map<string, Promise<unknown>>();
-let toolCacheHits = 0;
-let toolCacheStores = 0;
-const storeCache: { timestamp: number; data: Record<string, { found: boolean; moduleId?: number; source?: string; }> | null; } = {
-    timestamp: 0,
-    data: null
-};
-const patchedModulesCache = new Map<string, { timestamp: number; result: { patches: Array<{ moduleId: number; pluginName: string; find: string; replacements: number; }>; totalFound: number; offset: number; limit: number; hasMore: boolean; }; }>();
-const patchedModulesInFlight = new Map<string, Promise<{ patches: Array<{ moduleId: number; pluginName: string; find: string; replacements: number; }>; totalFound: number; offset: number; limit: number; hasMore: boolean; }>>();
-const exportModuleIdCache = new WeakMap<object, number>();
-const componentNameCache = new Map<number, { name: string; source: string; confidence: number; } | null>();
 const storeSnapshots = new Map<string, Record<string, unknown>>();
 
 type TraceEntry = { type: string; timestamp: number; payload: unknown; };
@@ -904,150 +336,6 @@ type InterceptEntry = {
 const intercepts = new Map<string, InterceptEntry>();
 const evalSession: { vars: Record<string, unknown>; } = { vars: {} };
 
-function stableStringify(value: unknown): string {
-    if (value === null || value === undefined) return String(value);
-    if (typeof value !== "object") return JSON.stringify(value);
-    if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-    const record = value as Record<string, unknown>;
-    const keys = Object.keys(record).sort();
-    return `{${keys.map(key => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(",")}}`;
-}
-
-function toOptionalBoolean(value: unknown): boolean | undefined {
-    return typeof value === "boolean" ? value : undefined;
-}
-
-function toOptionalNumber(value: unknown): number | undefined {
-    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
-}
-
-function toOptionalString(value: unknown): string | undefined {
-    return typeof value === "string" ? value : undefined;
-}
-
-function truncatePayload(payload: unknown, maxChars?: number) {
-    if (!maxChars || !Number.isFinite(maxChars)) return payload;
-    const limit = Math.max(200, Math.min(20000, Number(maxChars)));
-    const text = JSON.stringify(payload);
-    if (text.length <= limit) return payload;
-    return { truncated: true, preview: text.slice(0, limit), maxChars: limit };
-}
-
-function truncatePayloadDepth(payload: unknown, maxDepth?: number | null, depth = 0): unknown {
-    if (!maxDepth || !Number.isFinite(maxDepth)) return payload;
-    const limit = Math.max(1, Math.min(10, Number(maxDepth)));
-    if (payload === null || payload === undefined) return payload;
-    if (typeof payload !== "object") return payload;
-    if (depth >= limit) return { truncated: true, depth: limit };
-    if (Array.isArray(payload)) {
-        return payload.map(value => truncatePayloadDepth(value, limit, depth + 1));
-    }
-    const record = payload as Record<string, unknown>;
-    const next: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(record)) {
-        next[key] = truncatePayloadDepth(value, limit, depth + 1);
-    }
-    return next;
-}
-
-function isCacheableTool(name: string, args?: unknown): boolean {
-    if ([
-        "reloadDiscord",
-        "evaluateCode",
-        "batch_tools",
-        "analytics"
-    ].includes(name)) {
-        return false;
-    }
-
-    const params = (args && typeof args === "object") ? (args as Record<string, unknown>) : {};
-    const action = typeof params.action === "string" ? params.action : undefined;
-
-    if (name === "dom") return action !== "modify";
-    if (name === "flux") return action !== "dispatch";
-    if (name === "discord") return action !== "api";
-    if (name === "store") return action !== "call" && action !== "diff";
-    if (name === "plugin") {
-        if (action === "toggle") return false;
-        if (action === "settings" && "values" in params) return false;
-        return true;
-    }
-    return true;
-}
-
-function shouldCacheResult(value: unknown): boolean {
-    if (!value || typeof value !== "object") return true;
-    const record = value as Record<string, unknown>;
-    if ("error" in record) return false;
-    if (record.isError === true) return false;
-    if (record.cached === true) return false;
-    return true;
-}
-
-function getToolCacheTtlMs(name: string): number {
-    if (!settings.store.cacheEnabled) return 0;
-    return TOOL_CACHE_OVERRIDES.get(name) ?? settings.store.cacheTtlMs ?? TOOL_CACHE_TTL_MS;
-}
-
-function cleanupToolCache(): void {
-    const maxEntries = settings.store.cacheMaxEntries ?? TOOL_CACHE_MAX_ENTRIES;
-    if (toolResponseCache.size <= maxEntries) return;
-    const entries = Array.from(toolResponseCache.entries())
-        .sort((a, b) => a[1].timestamp - b[1].timestamp);
-    for (let i = 0; i < entries.length - maxEntries; i++) {
-        toolResponseCache.delete(entries[i][0]);
-    }
-}
-
-async function executeWithCache<T>(name: string, args: unknown, compute: () => Promise<T>): Promise<T> {
-    if (!settings.store.cacheEnabled || !isCacheableTool(name, args)) return compute();
-
-    const cacheKey = `${name}:${stableStringify(args ?? {})}`;
-    const baseTtlMs = getToolCacheTtlMs(name);
-    if (baseTtlMs <= 0) return compute();
-    const now = Date.now();
-    const cached = toolResponseCache.get(cacheKey);
-    if (cached && now - cached.timestamp < cached.ttlMs) {
-        toolCacheHits++;
-        if (cached.value && typeof cached.value === "object") {
-            if (Array.isArray(cached.value)) {
-                return { cached: true, result: cached.value } as T;
-            }
-            return { ...(cached.value as Record<string, unknown>), cached: true } as T;
-        }
-        return { cached: true, result: cached.value } as T;
-    }
-
-    const inflight = toolResponseInFlight.get(cacheKey) as Promise<T> | undefined;
-    if (inflight) return inflight;
-
-    const task = (async () => {
-        const startTime = performance.now();
-        const value = await compute();
-        const durationMs = Math.max(0, performance.now() - startTime);
-        if (shouldCacheResult(value)) {
-            const cachedValue = value && typeof value === "object" && "cached" in (value as Record<string, unknown>)
-                ? { ...(value as Record<string, unknown>), cached: false }
-                : value;
-            const adaptiveTtlMs = Math.min(
-                120000,
-                Math.max(baseTtlMs, Math.round(durationMs * 15))
-            );
-            toolResponseCache.set(cacheKey, { timestamp: Date.now(), ttlMs: adaptiveTtlMs, value: cachedValue });
-            toolCacheStores++;
-            cleanupToolCache();
-            return cachedValue as T;
-        }
-        return value;
-    })();
-
-    toolResponseInFlight.set(cacheKey, task);
-    try {
-        return await task;
-    } finally {
-        toolResponseInFlight.delete(cacheKey);
-    }
-}
 
 async function searchModulesInternal(args: { kind: string; pattern: string; limit?: number; isRegex?: boolean; }) {
     const kind = String(args.kind || "");
@@ -1163,12 +451,6 @@ async function getModuleContextInternal(moduleId: number, usePatched: boolean) {
     };
 }
 
-type BatchToolRequest = {
-    id?: string;
-    tool?: string;
-    arguments?: Record<string, unknown>;
-    timeoutMs?: number;
-};
 
 function shouldStreamBatch(args: Record<string, unknown>): boolean {
     if (args.stream === false) return false;
@@ -1985,26 +1267,6 @@ function findModuleIdFast(code: string): number | null {
     return null;
 }
 
-function parseRegex(pattern: string, flags: string): RegExp {
-    return new RegExp(pattern, flags);
-}
-
-function parseRegexArg(arg: string | { pattern: string; flags: string; }): string | RegExp {
-    if (typeof arg === "object" && arg && "pattern" in arg) {
-        return parseRegex(arg.pattern, arg.flags);
-    }
-    if (typeof arg === "string" && arg.startsWith("/") && arg.lastIndexOf("/") > 0) {
-        const lastSlash = arg.lastIndexOf("/");
-        const pattern = arg.substring(1, lastSlash);
-        const flags = arg.substring(lastSlash + 1);
-        try {
-            return parseRegex(pattern, flags);
-        } catch {
-            return arg;
-        }
-    }
-    return arg;
-}
 
 function resolvePluginName(input?: string): string {
     const raw = input?.trim();
@@ -2315,92 +1577,6 @@ function handleTestPatch(requestData: unknown) {
     };
 }
 
-function analyzePatternQuality(pattern: string) {
-    const warnings: string[] = [];
-    const anchors: string[] = [];
-    let score = 5;
-    const captureGroups = (pattern.match(/\((?!\?)/g) ?? []).length;
-
-    if (/#\{intl::/.test(pattern)) {
-        anchors.push("intl");
-        score += 3;
-    }
-    if (/"[^"]{3,}"/.test(pattern) || /'[^']{3,}'/.test(pattern)) {
-        anchors.push("string-literal");
-        score += 2;
-    }
-    if (/[A-Za-z_$][\w$]*:/.test(pattern)) {
-        anchors.push("prop-name");
-        score += 2;
-    }
-    if (/\\i/.test(pattern)) {
-        anchors.push("identifier");
-        score += 1;
-    }
-
-    if (/\b(function|return|if|for|while|const|let)\b/.test(pattern)) {
-        warnings.push("Anchored on generic keywords; prefer stable strings or props.");
-        score -= 2;
-    }
-    if (/\.\+\?|\.\*\?|\.\+|\.\*/.test(pattern)) {
-        warnings.push("Uses unbounded wildcards; prefer explicit .{0,N} limits.");
-        score -= 1;
-    }
-    if (pattern.length > 200) {
-        warnings.push("Pattern is long; consider a shorter, more stable anchor.");
-        score -= 1;
-    }
-    if (captureGroups > 3) {
-        warnings.push("Many capture groups; consider reducing captures to simplify the patch.");
-        score -= 1;
-    }
-    if (!anchors.length) {
-        warnings.push("No strong anchors detected; consider an intl key or unique string.");
-        score -= 1;
-    }
-
-    score = Math.max(1, Math.min(10, score));
-    return { score, anchors, warnings, captureGroups, anchorCount: anchors.length };
-}
-
-function extractAnchorCandidates(snippet: string) {
-    const candidates: string[] = [];
-    const seen = new Set<string>();
-    const push = (value: string) => {
-        if (!value || seen.has(value)) return;
-        seen.add(value);
-        candidates.push(value);
-    };
-
-    for (const match of snippet.matchAll(/#\{intl::[A-Z0-9_]+\}/g)) {
-        push(match[0]);
-    }
-    for (const match of snippet.matchAll(/(["'])([^"'\\]{4,60})\1/g)) {
-        const value = match[0];
-        if (value.includes(" ")) continue;
-        push(value);
-    }
-    for (const match of snippet.matchAll(/\b[A-Za-z_$][\w$]*:/g)) {
-        push(match[0]);
-    }
-
-    return candidates.slice(0, 6);
-}
-
-function extractStringLiterals(source: string, minLength = 4, maxLength = 80, limit = 20) {
-    const counts = new Map<string, number>();
-    const regex = /(["'])([^"'\\]{4,80})\1/g;
-    for (const match of source.matchAll(regex)) {
-        const value = match[2];
-        if (value.length < minLength || value.length > maxLength) continue;
-        counts.set(value, (counts.get(value) ?? 0) + 1);
-    }
-    const items = Array.from(counts.entries())
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, limit)
-        .map(([value, count]) => ({ value, count }));
-    return { items, totalUnique: counts.size };
-}
 
 function handlePatchLint(requestData: unknown) {
     const { find, replacements, moduleId } = requestData as PatchLintRequest;
@@ -3997,270 +3173,7 @@ async function handleSearchLiteral(requestData: unknown) {
     };
 }
 
-function parsePotentialRegex(query: string, isRegex: boolean): { regex: RegExp | null; patternString: string | null; } {
-    if (!isRegex && query.startsWith("/") && query.lastIndexOf("/") > 0) {
-        const lastSlash = query.lastIndexOf("/");
-        const body = query.substring(1, lastSlash);
-        const flags = query.substring(lastSlash + 1);
-        try {
-            return { regex: new RegExp(body, flags), patternString: null };
-        } catch { /* fall through */ }
-    }
-    if (isRegex) {
-        try {
-            return { regex: new RegExp(query), patternString: null };
-        } catch { /* ignore */ }
-    }
-    return { regex: null, patternString: query };
-}
 
-function escapeRegex(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function parseRegexString(arg: string): FindNode {
-    if (arg.startsWith("/")) {
-        const lastSlash = arg.lastIndexOf("/");
-        if (lastSlash > 0) {
-            const pattern = arg.substring(1, lastSlash);
-            const flags = arg.substring(lastSlash + 1);
-            return { type: "regex", value: { pattern, flags } };
-        }
-    }
-    return { type: "string", value: arg };
-}
-
-function storeResource(text: string, mimeType: string): string {
-    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    resourceStore.set(id, { mimeType, text, createdAt: Date.now() });
-    pruneResources();
-    return id;
-}
-
-function updateResource(id: string, text: string, mimeType: string): void {
-    const entry = resourceStore.get(id);
-    if (entry) {
-        entry.text = text;
-        entry.mimeType = mimeType;
-        entry.createdAt = Date.now();
-        return;
-    }
-    resourceStore.set(id, { mimeType, text, createdAt: Date.now() });
-    pruneResources();
-}
-
-function readResource(id: string, offset?: number, length?: number) {
-    const entry = resourceStore.get(id);
-    if (!entry) {
-        throw new Error(`Resource not found: ${id}`);
-    }
-    const start = Math.max(0, offset ?? 0);
-    const end = length ? start + Math.max(0, length) : entry.text.length;
-    const slice = entry.text.slice(start, end);
-    return {
-        mimeType: entry.mimeType,
-        text: slice,
-        truncated: end < entry.text.length,
-        total: entry.text.length,
-        raw: true
-    };
-}
-
-function pruneResources() {
-    const now = Date.now();
-    for (const [id, entry] of resourceStore.entries()) {
-        if (now - entry.createdAt > RESOURCE_MAX_AGE_MS) {
-            resourceStore.delete(id);
-        }
-    }
-    if (resourceStore.size > RESOURCE_MAX_ENTRIES) {
-        const oldest = [...resourceStore.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt);
-        for (let i = 0; i < oldest.length - RESOURCE_MAX_ENTRIES; i++) {
-            resourceStore.delete(oldest[i][0]);
-        }
-    }
-}
-
-function buildResourceResponse(data: unknown, mimeType = "application/json", previewLength = 800): ToolCallResult {
-    if (data && typeof data === "object" && (data as Record<string, unknown>).raw === true) {
-        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
-    }
-    const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
-    if (text.length <= previewLength * 4) {
-        return { content: [{ type: "text", text }] };
-    }
-    const resourceId = storeResource(text, mimeType);
-    const preview = text.slice(0, previewLength) + "...";
-    return {
-        content: [
-            {
-                type: "text",
-                text: JSON.stringify({
-                    resourceId,
-                    preview,
-                    totalBytes: text.length,
-                    mimeType,
-                    summary: summarizeValue(data)
-                }, null, 2)
-            }
-        ]
-    };
-}
-
-function getErrorHint(message: string): string | null {
-    if (/required/.test(message)) return "Check required fields in the request.";
-    if (/Expected exactly 1 match/.test(message)) return "Refine the find pattern or run patch.unique first.";
-    if (/had no effect/.test(message)) return "Match did not apply; check pattern and preview context.";
-    if (/Pattern not found/.test(message)) return "Find string did not exist in the target module.";
-    if (/timed out|timeout/i.test(message)) return "Retry after Discord finishes loading.";
-    return null;
-}
-
-function buildErrorResponse(message: string, where?: string): ToolCallResult {
-    const hint = getErrorHint(message);
-    const payload: Record<string, unknown> = { error: message };
-    if (where) payload.where = where;
-    if (hint) payload.hint = hint;
-    return {
-        content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-        isError: true
-    };
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-    return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-function summarizeValue(value: unknown) {
-    if (Array.isArray(value)) {
-        return { type: "array", count: value.length };
-    }
-    if (isPlainObject(value)) {
-        const keys = Object.keys(value);
-        const arrayCounts: Record<string, number> = {};
-        const stringLengths: Record<string, number> = {};
-        for (const key of keys) {
-            const entry = value[key];
-            if (Array.isArray(entry)) arrayCounts[key] = entry.length;
-            else if (typeof entry === "string") stringLengths[key] = entry.length;
-        }
-        return {
-            type: "object",
-            keys,
-            arrayCounts,
-            stringLengths
-        };
-    }
-    return { type: typeof value };
-}
-
-function trimTopLevel(value: unknown, maxItems?: number, maxChars?: number) {
-    const truncation: Record<string, { total?: number; returned?: number; length?: number; truncated?: boolean; }> = {};
-    if (Array.isArray(value)) {
-        if (typeof maxItems === "number" && maxItems >= 0 && value.length > maxItems) {
-            const trimmed = value.slice(0, maxItems);
-            return {
-                value: { items: trimmed, total: value.length, truncated: true },
-                truncation: { __root__: { total: value.length, returned: trimmed.length, truncated: true } }
-            };
-        }
-        return { value, truncation };
-    }
-    if (isPlainObject(value)) {
-        const result: Record<string, unknown> = { ...value };
-        for (const [key, entry] of Object.entries(result)) {
-            if (Array.isArray(entry) && typeof maxItems === "number" && maxItems >= 0 && entry.length > maxItems) {
-                result[key] = entry.slice(0, maxItems);
-                truncation[key] = { total: entry.length, returned: (result[key] as unknown[]).length, truncated: true };
-            } else if (typeof entry === "string" && typeof maxChars === "number" && maxChars >= 0 && entry.length > maxChars) {
-                result[key] = entry.slice(0, Math.max(0, maxChars - 3)) + "...";
-                truncation[key] = { length: entry.length, truncated: true };
-            }
-        }
-        return { value: result, truncation };
-    }
-    if (typeof value === "string" && typeof maxChars === "number" && maxChars >= 0 && value.length > maxChars) {
-        return { value: value.slice(0, Math.max(0, maxChars - 3)) + "...", truncation: { __root__: { length: value.length, truncated: true } } };
-    }
-    return { value, truncation };
-}
-
-function buildToolResponse(result: unknown, args?: Record<string, unknown>): ToolCallResult {
-    const summary = Boolean(args?.summary);
-    const maxItems = typeof args?.maxItems === "number" ? Number(args.maxItems) : undefined;
-    const maxChars = typeof args?.maxChars === "number" ? Number(args.maxChars) : undefined;
-    if (!summary && maxItems === undefined && maxChars === undefined) {
-        return buildResourceResponse(result);
-    }
-    const defaults = summary
-        ? {
-            maxItems: maxItems ?? 10,
-            maxChars: maxChars ?? 200
-        }
-        : { maxItems, maxChars };
-    const trimmed = trimTopLevel(result, defaults.maxItems, defaults.maxChars);
-    const payload = summary
-        ? {
-            summary: summarizeValue(result),
-            truncation: Object.keys(trimmed.truncation).length ? trimmed.truncation : undefined,
-            data: trimmed.value
-        }
-        : (Object.keys(trimmed.truncation).length
-            ? { data: trimmed.value, truncation: trimmed.truncation }
-            : trimmed.value);
-    return buildResourceResponse(payload);
-}
-
-function safeSerialize(value: unknown): unknown {
-    const seen = new WeakSet<object>();
-    const MAX_DEPTH = 6;
-    const MAX_KEYS = 40;
-    const MAX_ARRAY = 100;
-    const MAX_STRING = 10000;
-
-    const serialize = (val: unknown, depth: number): unknown => {
-        if (depth > MAX_DEPTH) return "[Max Depth]";
-        if (val === null || val === undefined) return val;
-        if (typeof val === "bigint") return val.toString();
-        if (typeof val === "function") {
-            const source = val.toString();
-            return source.length > MAX_STRING ? source.slice(0, MAX_STRING) + "..." : source;
-        }
-        if (typeof val === "string") {
-            return val.length > MAX_STRING ? val.slice(0, MAX_STRING) + "..." : val;
-        }
-        if (typeof val !== "object") return val;
-
-        if (seen.has(val as object)) return "[Circular]";
-        seen.add(val as object);
-
-        if (val instanceof Map) {
-            return serialize(Object.fromEntries(val), depth + 1);
-        }
-        if (val instanceof Set) {
-            return serialize(Array.from(val), depth + 1);
-        }
-        if (val instanceof RegExp) return val.toString();
-        if (val instanceof Error) {
-            return { error: val.message, stack: val.stack };
-        }
-        if (Array.isArray(val)) {
-            return val.slice(0, MAX_ARRAY).map(item => serialize(item, depth + 1));
-        }
-
-        const obj: Record<string, unknown> = {};
-        for (const key of Object.keys(val as object).slice(0, MAX_KEYS)) {
-            obj[key] = serialize((val as Record<string, unknown>)[key], depth + 1);
-        }
-        return obj;
-    };
-
-    try {
-        return serialize(value, 0);
-    } catch {
-        return String(value);
-    }
-}
 
 function getStoreByName(storeName: string): any | null {
     const results = findAll(filters.byStoreName(storeName));
@@ -6518,11 +5431,10 @@ function ensureConnection(port: number, isManual: boolean) {
         if (isManual) {
             const msg = `Stopped reconnecting on port ${port} after ${state.reconnectAttempts} attempts`;
             logger.warn(msg);
-            Toasts.show({
-                message: msg,
-                id: Toasts.genId(),
-                type: Toasts.Type.FAILURE,
-                options: { position: Toasts.Position.TOP }
+            showNotification({
+                title: "Dev Companion Extended",
+                body: msg,
+                color: "var(--red-360)"
             });
         } else {
             recordStoppedPort(port);
@@ -6541,13 +5453,10 @@ function ensureConnection(port: number, isManual: boolean) {
             state.reconnectAttempts = 0;
 
             if (settings.store.notifyOnConnect || isManual) {
-                Toasts.show({
-                    message: `Dev Companion connected (port ${port})`,
-                    id: Toasts.genId(),
-                    type: Toasts.Type.SUCCESS,
-                    options: {
-                        position: Toasts.Position.TOP
-                    }
+                showNotification({
+                    title: `Dev Companion Extended`,
+                    body: `Connection established on port ${port}`,
+                    noPersist: true,
                 });
             }
         });
@@ -6655,178 +5564,11 @@ function ensureConnection(port: number, isManual: boolean) {
         logger.error("Failed to create WebSocket: " + String(error));
 
         if (isManual) {
-            Toasts.show({
-                message: `Failed to connect to MCP server on port ${port}`,
-                id: Toasts.genId(),
-                type: Toasts.Type.FAILURE,
-                options: {
-                    position: Toasts.Position.TOP
-                }
+            showNotification({
+                title: "Dev Companion Extended",
+                body: `Failed to connect to MCP server on port ${port}`,
+                color: "var(--red-360)"
             });
         }
     }
-}
-function sliceSnippets(text: string, matches: RegExpMatchArray[] | null, limit: number, radius = 60): string[] {
-    if (!matches) return [];
-    const snippets: string[] = [];
-    for (let i = 0; i < matches.length && snippets.length < limit; i++) {
-        const m = matches[i];
-        if (typeof m.index !== "number") continue;
-        const start = Math.max(0, m.index - radius);
-        const end = Math.min(text.length, m.index + (m[0]?.length || 0) + radius);
-        snippets.push(text.slice(start, end).replace(/\s+/g, " "));
-    }
-    return snippets;
-}
-
-function getLineColumn(text: string, index: number) {
-    const safeIndex = Math.max(0, Math.min(text.length, index));
-    const before = text.slice(0, safeIndex);
-    const lines = before.split("\n");
-    const line = lines.length;
-    const column = lines[lines.length - 1].length + 1;
-    return { line, column };
-}
-
-function getLineContext(text: string, index: number, contextLines: number) {
-    const { line } = getLineColumn(text, index);
-    const lines = text.split("\n");
-    const start = Math.max(0, line - 1 - contextLines);
-    const end = Math.min(lines.length, line - 1 + contextLines + 1);
-    const before = lines.slice(start, line - 1);
-    const current = lines[line - 1] ?? "";
-    const after = lines.slice(line, end);
-    return { before, current, after, line };
-}
-
-function normalizeRegex(pattern: string | RegExp) {
-    const regex = pattern instanceof RegExp ? pattern : new RegExp(escapeRegex(pattern), "g");
-    const flags = regex.flags.replace("g", "");
-    return new RegExp(regex.source, flags);
-}
-
-type MatchContextResult =
-    | { found: false; }
-    | {
-        found: true;
-        index: number;
-        line: number;
-        column: number;
-        match: string;
-        matchLength: number;
-        snippet: string;
-        context: ReturnType<typeof getLineContext>;
-    };
-
-function getMatchContext(text: string, pattern: string | RegExp, contextLines = 2, radius = 120): MatchContextResult {
-    const safePattern = normalizeRegex(pattern);
-    const matcher = canonicalizeMatch(safePattern);
-    const match = matcher.exec(text);
-    if (!match || typeof match.index !== "number") {
-        return { found: false };
-    }
-    const { index } = match;
-    const { line, column } = getLineColumn(text, index);
-    const snippet = text.slice(Math.max(0, index - radius), Math.min(text.length, index + match[0].length + radius));
-    const matchLength = match[0]?.length ?? 0;
-    return {
-        found: true,
-        index,
-        line,
-        column,
-        match: match[0],
-        matchLength,
-        snippet,
-        context: getLineContext(text, index, contextLines)
-    };
-}
-
-function findLookbehindAnchor(text: string, pattern: string | RegExp) {
-    const safePattern = normalizeRegex(pattern);
-    const matcher = canonicalizeMatch(safePattern);
-    const match = matcher.exec(text);
-    if (!match) return null;
-    const lastGroup = match.length > 1 ? match[match.length - 1] : "";
-    if (!lastGroup) return null;
-    const anchorIndex = text.indexOf(lastGroup, match.index ?? 0);
-    return anchorIndex >= 0 ? anchorIndex : null;
-}
-
-function collectPatchWarnings(
-    text: string,
-    replacements: Array<{ match: string | { pattern: string; flags: string; }; replace: string; }>
-) {
-    const warnings: string[] = [];
-    const invalidChildrenArrow = /children:[A-Za-z_$][\w$]*\([^)]*\)=>/;
-    if (invalidChildrenArrow.test(text)) {
-        warnings.push("Detected children:<call>(...)=> pattern; this usually means a replacement hit the render-prop argument instead of the inner children value.");
-    }
-    if (/,\s*,/.test(text)) {
-        warnings.push("Detected consecutive commas; this often means a replacement appended a comma after an existing comma.");
-    }
-    if (replacements.length > 1) {
-        warnings.push("Patch has multiple replacements; consider simplifying to reduce break risk.");
-    }
-    const selfRefs = new Set<string>();
-    for (const replacement of replacements) {
-        if (typeof replacement.replace !== "string") continue;
-        for (const match of replacement.replace.matchAll(/\$self\.([A-Za-z_$][\w$]*)/g)) {
-            selfRefs.add(match[1]);
-        }
-    }
-    if (selfRefs.size) {
-        warnings.push(`Patch references $self.${Array.from(selfRefs).join(", ")}; ensure these methods are exported on the plugin object.`);
-    }
-    return warnings;
-}
-
-function trimPreviewText(value: string, maxLength = 160) {
-    if (value.length <= maxLength) return value;
-    return value.slice(0, Math.max(0, maxLength - 3)) + "...";
-}
-
-const SENSITIVE_KEY_REGEX = /token|authorization|cookie|password|pass|email|phone|secret/i;
-const TOKEN_VALUE_REGEX = /[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{10,}/g;
-
-function filterFields(value: unknown, fields?: string[] | null): unknown {
-    if (!fields || fields.length === 0) return value;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
-    const record = value as Record<string, unknown>;
-    const filtered: Record<string, unknown> = {};
-    for (const key of fields) {
-        if (key in record) filtered[key] = record[key];
-    }
-    return filtered;
-}
-
-function ensureBaseFields(entry: Record<string, unknown>, base: Record<string, unknown>) {
-    for (const [key, value] of Object.entries(base)) {
-        if (!(key in entry)) entry[key] = value;
-    }
-    return entry;
-}
-
-function redactSensitive(value: unknown, depth = 0): unknown {
-    if (depth > 4) return value;
-    if (value === null || value === undefined) return value;
-    if (typeof value === "string") {
-        if (TOKEN_VALUE_REGEX.test(value)) {
-            TOKEN_VALUE_REGEX.lastIndex = 0;
-            return value.replace(TOKEN_VALUE_REGEX, "[redacted]");
-        }
-        return value;
-    }
-    if (typeof value !== "object") return value;
-    if (Array.isArray(value)) return value.map(item => redactSensitive(item, depth + 1));
-
-    const record = value as Record<string, unknown>;
-    const result: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(record)) {
-        if (SENSITIVE_KEY_REGEX.test(key)) {
-            result[key] = "[redacted]";
-            continue;
-        }
-        result[key] = redactSensitive(val, depth + 1);
-    }
-    return result;
 }
